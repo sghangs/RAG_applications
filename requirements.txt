@@ -7,3 +7,10 @@ langchain_core
 faiss-cpu
 streamlit
 langchain_groq
+langchain-text-splitters
+langchain-openai
+chromadb
+langchain_huggingface
+langchain_chroma
+deepeval
+
