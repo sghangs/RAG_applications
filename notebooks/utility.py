@@ -8,6 +8,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.vectorstores import FAISS
 import textwrap
+import pymupdf
 
 
 
@@ -101,4 +102,80 @@ def text_wrap(text, width=120):
         str: The wrapped text.
     """
     return textwrap.fill(text, width=width)
+
+def read_pdf_to_string(path):
+    """
+    Read a PDF document from the specified path and return its content as a string.
+
+    Args:
+        path (str): The file path to the PDF document.
+
+    Returns:
+        str: The concatenated text content of all pages in the PDF document.
+
+    The function uses the 'fitz' library (PyMuPDF) to open the PDF document, iterate over each page,
+    extract the text content from each page, and append it to a single string.
+    """
+    # Open the PDF document located at the specified path
+    doc = pymupdf.open(path)
+    content = ""
+    # Iterate over each page in the document
+    for page_num in range(len(doc)):
+        # Get the current page
+        page = doc[page_num]
+        # Extract the text content from the current page and append it to the content string
+        content += page.get_text()
+    return content
+
+def encode_from_string(content, chunk_size=1000, chunk_overlap=200):
+    """
+    Encodes a string into a vector store using OpenAI embeddings.
+
+    Args:
+        content (str): The text content to be encoded.
+        chunk_size (int): The size of each chunk of text.
+        chunk_overlap (int): The overlap between chunks.
+
+    Returns:
+        FAISS: A vector store containing the encoded content.
+
+    Raises:
+        ValueError: If the input content is not valid.
+        RuntimeError: If there is an error during the encoding process.
+    """
+
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Content must be a non-empty string.")
+
+    if not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer.")
+
+    if not isinstance(chunk_overlap, int) or chunk_overlap < 0:
+        raise ValueError("chunk_overlap must be a non-negative integer.")
+
+    try:
+        # Split the content into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=len,
+            is_separator_regex=False,
+        )
+        chunks = text_splitter.create_documents([content])
+
+        # Assign metadata to each chunk
+        for chunk in chunks:
+            chunk.metadata['relevance_score'] = 1.0
+
+        # Generate embeddings and create the vector store
+        #Embeddings 
+        embeddings=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+
+    except Exception as e:
+        raise RuntimeError(f"An error occurred during the encoding process: {str(e)}")
+
+    return vectorstore
+
+
 

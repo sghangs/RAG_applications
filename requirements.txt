@@ -13,4 +13,5 @@ chromadb
 langchain_huggingface
 langchain_chroma
 deepeval
+pymupdf
 
