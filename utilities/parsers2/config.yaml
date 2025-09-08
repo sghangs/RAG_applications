@@ -1,0 +1,40 @@
+pdf:
+  text_threshold: 120
+  enable_ocr: true
+  preprocessing:
+    lowercase: true
+    remove_punctuation: true
+    remove_stopwords: true
+    normalize_whitespace: true
+
+docx:
+  text_threshold: 30
+  enable_ocr_images: true
+  preprocessing:
+    lowercase: false
+    remove_punctuation: true
+    normalize_whitespace: true
+
+pptx:
+  text_threshold: 50
+  enable_ocr_images: true
+  preprocessing:
+    lowercase: true
+    normalize_whitespace: true
+
+excel:
+  enable_ocr: false
+  preprocessing:
+    normalize_whitespace: true
+
+csv:
+  enable_ocr: false
+  preprocessing:
+    normalize_whitespace: true
+
+txt:
+  enable_ocr: false
+  preprocessing:
+    lowercase: true
+    remove_punctuation: false
+    normalize_whitespace: true
