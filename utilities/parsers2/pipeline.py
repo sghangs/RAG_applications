@@ -1,52 +1,79 @@
+import os
+from connectors.local import LocalConnector
+from parsers.parser_factory import ParserFactory
+from chunking.smart_chunker import SmartChunker
+from embedding.embedder import Embedder
+from indexing.vector_index import VectorIndex
+from indexing.sparse_index import SparseIndex
+from indexing.metadata_store import MetadataStore
 from utils.logger import logger
 from exceptions import KnowledgeManagementException
-from parsers.parser_factory import ParserFactory
-from preprocessing.cleaner import TextCleaner
-from chunking.smart_chunker import SmartChunker
-import os
 
 
 class IngestionPipeline:
-    def __init__(self, input_dir="data/raw"):
-        self.input_dir = input_dir
-        self.cleaner = TextCleaner()
-        self.chunker = SmartChunker(max_tokens=500, overlap=50)
+    """
+    Orchestrates file ingestion:
+    - Fetch file (from raw folder or other connector)
+    - Parse & preprocess
+    - Chunk
+    - Embed
+    - Index (vector + sparse)
+    - Store metadata
+    """
+
+    def __init__(self, raw_folder="data/raw"):
+        self.raw_folder = raw_folder
+        self.connector = LocalConnector()
+        self.chunker = SmartChunker()
+        self.embedder = Embedder()
+        self.vector_index = VectorIndex()
+        self.sparse_index = SparseIndex()
+        self.metadata_store = MetadataStore("postgres://user:pwd@localhost/db")
 
     def run(self):
-        logger.info(f"Starting ingestion pipeline on {self.input_dir}")
+        try:
+            files = [f for f in os.listdir(self.raw_folder) if os.path.isfile(os.path.join(self.raw_folder, f))]
+            logger.info(f"Discovered {len(files)} files in {self.raw_folder}")
 
-        if not os.path.exists(self.input_dir):
-            raise KnowledgeManagementException("Input directory not found", self.input_dir, "PipelineInit")
+            for filename in files:
+                filepath = os.path.join(self.raw_folder, filename)
+                logger.info(f"Processing {filepath}")
 
-        results = {}
+                try:
+                    content = self.connector.fetch(filepath)
+                    blocks = ParserFactory.parse_and_clean(filename, content)
 
-        for filename in os.listdir(self.input_dir):
-            file_path = os.path.join(self.input_dir, filename)
-            if not os.path.isfile(file_path):
-                continue
+                    chunks = self.chunker.chunk(blocks)
+                    logger.info(f"Generated {len(chunks)} chunks for {filename}")
 
-            logger.info(f"Processing file: {filename}")
+                    embeddings = self.embedder.embed_batch([c["text"] for c in chunks])
 
-            try:
-                with open(file_path, "rb") as f:
-                    content = f.read()
+                    self.vector_index.upsert(embeddings, chunks)
+                    self.sparse_index.index_chunks(chunks)
 
-                parser = ParserFactory.get_parser(filename, content)
-                blocks = parser.parse(content)
+                    self.metadata_store.upsert_document(
+                        doc_id=filename,  # replace with UUID if needed
+                        title=filename,
+                        uri=filepath,
+                        checksum="checksum123",  # TODO: replace with real hash
+                        project="KnowledgeBase"
+                    )
 
-                # 🔹 NEW: clean parsed blocks
-                cleaned_blocks = self.cleaner.clean_blocks(blocks)
+                    logger.info(f"Successfully ingested {filename}")
 
-                # 🔹 Chunking
-                chunks = self.chunker.chunk(cleaned_blocks)
+                except KnowledgeManagementException as e:
+                    logger.error(f"Pipeline error for {filename}: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error for {filename}: {e}")
 
-                results[filename] = chunks
-                logger.info(f"Processed {filename}: {len(blocks)} raw → {len(cleaned_blocks)} cleaned → {len(chunks)} chunks")
+        except Exception as e:
+            raise KnowledgeManagementException(
+                f"Pipeline failed: {e}",
+                None,
+                "IngestionPipeline"
+            )
 
-            except KnowledgeManagementException as e:
-                logger.error(f"KnowledgeManagementException: {e}")
-            except Exception as e:
-                logger.error(f"Unhandled error in {filename}: {str(e)}")
-                raise KnowledgeManagementException(str(e), filename, "Parsing")
 
-        return results
+if __name__ == "__main__":
+    pipeline = IngestionPipeline()
+    pipeline.run()
