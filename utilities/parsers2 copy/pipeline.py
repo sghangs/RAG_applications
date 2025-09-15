@@ -1,81 +1,122 @@
+# ingestion/pipeline.py
 import hashlib
+import uuid
 import requests
-from ingestion.parsers.parse_factory import ParserFactory
+from typing import List, Dict, Any
+from ingestion.parsers.parser_factory import ParserFactory
+from ingestion.preprocessing.cleaner import TextCleaner
 from ingestion.chunking.smart_chunker import SmartChunker
 from ingestion.embedding.embedder import Embedder
 from ingestion.indexing.vector_index import VectorIndex
 from ingestion.indexing.sparse_index import SparseIndex
 from ingestion.indexing.metadata_store import MetadataStore
-from ingestion.utils.logger import get_logger
+from ingestion.utils.logger import logger
 from ingestion.utils.exceptions import KnowledgeManagementException
 
-logger = get_logger(__name__)
+def chunk_text_hash(text: str) -> str:
+    """Return sha256 hex of canonicalized chunk text."""
+    # canonicalize: normalize whitespace (more normalization can be added)
+    normalized = " ".join(text.split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-def _checksum(content: bytes) -> str:
-    """Generate checksum for deduplication/update detection."""
-    return hashlib.sha256(content).hexdigest()
+def chunk_point_id_from_hash(chunk_hash: str) -> str:
+    """Deterministic UUIDv5 id derived from chunk hash (stable across runs)."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_hash))
 
 
-def run_ingestion(file_url: str, doc_id: str, project: str, event_type: str = "created"):
-    """
-    Ingest or update or delete document into vector/sparse indexes.
-    
-    Args:
-        file_url (str): Download URL of the file
-        doc_id (str): Unique identifier (SharePoint item ID)
-        project (str): Project name
-        event_type (str): "created", "updated", or "deleted"
-    """
-    try:
-        metadata_store = MetadataStore("postgres://user:pwd@localhost/db")
-        vector_index = VectorIndex()
-        sparse_index = SparseIndex()
-        embedder = Embedder()
-        chunker = SmartChunker()
+class IngestionPipeline:
+    def __init__(self):
+        self.cleaner = TextCleaner()            # should canonicalize text consistently
+        self.chunker = SmartChunker()           # deterministic chunking
+        self.embedder = Embedder()
+        self.vector_index = VectorIndex()
+        self.sparse_index = SparseIndex()
+        self.metadata_store = MetadataStore()   # must support per-chunk persistence
 
-        # Handle delete
-        if event_type == "deleted":
-            logger.info(f"Deleting document {doc_id} from indexes")
-            vector_index.delete(doc_id)
-            sparse_index.delete(doc_id)
-            metadata_store.delete_document(doc_id)
-            return
+    def ingest_file(self, doc_id: str, content: bytes, filename: str, project: str = "KB"):
+        """
+        doc_id: stable id from SharePoint (item id) or path
+        content: raw bytes
+        """
+        try:
+            # 1. Parse
+            parser = ParserFactory.get_parser(filename, content)  # adjust signature if needed
+            blocks = parser.parse(content)
 
-        # Download content
-        resp = requests.get(file_url)
-        if resp.status_code != 200:
-            raise KnowledgeManagementException(f"Failed to download file: {resp.text}")
-        content = resp.content
+            # 2. Clean and chunk
+            cleaned_blocks = self.cleaner.clean_blocks(blocks)
+            chunks = self.chunker.chunk(cleaned_blocks)  # returns list of {"text", "metadata"}
 
-        checksum = _checksum(content)
-        old_checksum = metadata_store.get_checksum(doc_id)
+            # 3. Build new chunk-hash map (preserve positions)
+            new_chunk_infos: List[Dict[str, Any]] = []
+            for pos, c in enumerate(chunks):
+                text = c["text"]
+                c_hash = chunk_text_hash(text)
+                point_id = chunk_point_id_from_hash(c_hash)
+                new_chunk_infos.append({
+                    "hash": c_hash,
+                    "point_id": point_id,
+                    "text": text,
+                    "pos": pos,
+                    "metadata": c.get("metadata", {})
+                })
 
-        # Skip if no change
-        if event_type == "updated" and checksum == old_checksum:
-            logger.info(f"Document {doc_id} unchanged, skipping re-ingestion")
-            return
+            new_hash_set = {ci["hash"] for ci in new_chunk_infos}
 
-        # Parse
-        parser = ParserFactory.get_parser(file_url)
-        blocks = parser.parse(content)
+            # 4. Load old chunk hashes for this doc
+            old_chunk_hashes = self.metadata_store.get_doc_chunk_hashes(doc_id) or set()
 
-        # Chunk
-        chunks = chunker.chunk(blocks)
+            # 5. Determine diffs
+            added_hashes = new_hash_set - old_chunk_hashes
+            removed_hashes = old_chunk_hashes - new_hash_set
+            unchanged_hashes = new_hash_set & old_chunk_hashes
 
-        # Embed
-        embeddings = embedder.embed_batch([c["text"] for c in chunks])
+            logger.info(f"Doc {doc_id}: added={len(added_hashes)}, removed={len(removed_hashes)}, unchanged={len(unchanged_hashes)}")
 
-        # Upsert
-        vector_index.upsert(embeddings, chunks, doc_id=doc_id)
-        sparse_index.index_chunks(chunks, doc_id=doc_id)
+            # 6. Prepare added chunk objects in deterministic order
+            hashes_to_infos = {ci["hash"]: ci for ci in new_chunk_infos}
+            added_infos = [hashes_to_infos[h] for h in new_chunk_infos if h["hash"] in added_hashes]  # preserve order
 
-        # Update metadata
-        metadata_store.upsert_document(
-            doc_id, title=file_url.split("/")[-1],
-            uri=file_url, checksum=checksum, project=project
-        )
+            # 7. Embed added chunks only (batch)
+            if added_infos:
+                texts = [ci["text"] for ci in added_infos]
+                embeddings = self.embedder.embed_batch(texts)
+                # upsert to vector DB with stable point ids
+                points = []
+                for emb, ci in zip(embeddings, added_infos):
+                    payload = {
+                        "text": ci["text"],
+                        "metadata": {
+                            **ci["metadata"],
+                            "doc_id": doc_id,
+                            "pos": ci["pos"],
+                            "chunk_hash": ci["hash"]
+                        }
+                    }
+                    points.append({"id": ci["point_id"], "vector": emb, "payload": payload})
+                self.vector_index.upsert_points(points)
 
-        logger.info(f"Ingestion complete for {doc_id}, event={event_type}")
+                # also index in sparse index
+                self.sparse_index.index_chunks([
+                    {"id": ci["point_id"], "text": ci["text"], "metadata": {"doc_id": doc_id, "pos": ci["pos"], "chunk_hash": ci["hash"]}}
+                    for ci in added_infos
+                ])
 
-    except Exception as e:
-        raise KnowledgeManagementException(f"Pipeline ingestion failed: {str(e)}")
+            # 8. Handle removed chunks: delete or update payload to remove doc reference.
+            if removed_hashes:
+                # find point ids for removed hashes
+                removed_point_ids = [chunk_point_id_from_hash(h) for h in removed_hashes]
+                # If your system allows shared chunks across docs, you might instead remove only doc reference.
+                # Here we delete points completely (if you do not share across docs).
+                self.vector_index.delete_points(removed_point_ids)
+                self.sparse_index.delete_chunks_by_ids(removed_point_ids)
+
+            # 9. Update metadata: store new set of hashes for doc (and optionally positions)
+            # metadata_store should atomically set doc->list_of_hashes and chunk->info mapping
+            self.metadata_store.set_doc_chunk_hashes(doc_id, new_hash_set, new_chunk_infos)
+
+            logger.info(f"Ingestion finished for doc {doc_id}")
+
+        except Exception as e:
+            logger.exception(f"Error ingesting {doc_id}: {e}")
+            raise KnowledgeManagementException(str(e), doc_id, "ingest_file")
