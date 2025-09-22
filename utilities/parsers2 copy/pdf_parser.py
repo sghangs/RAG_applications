@@ -13,7 +13,8 @@ class HybridPDFParser:
     - Uses pdfplumber for improved table parsing
     - Falls back to Unstructured OCR if page has little/no text
     - Deduplicates overlapping table text from PyMuPDF output
-    - Emits separate blocks: {"type": "text"} and {"type": "table"}
+    - Runs OCR on embedded images even if text exists
+    - Emits separate blocks: {"type": "text"}, {"type": "table"}, {"type": "image_text"}
     """
 
     def __init__(self, text_threshold: int = 100, enable_ocr: bool = True):
@@ -45,16 +46,14 @@ class HybridPDFParser:
             logger.warning(f"pdfplumber failed on page {page_num+1}: {e}")
         return tables_text, table_bboxes
 
-    def _extract_with_ocr(self, page, page_num: int) -> list[dict]:
-        """Extract text and tables with OCR for image-heavy or text-poor pages."""
+    def _extract_with_ocr(self, page_bytes: bytes, page_num: int, source: str = "unstructured-ocr") -> list[dict]:
+        """Run OCR on a full page or image bytes and return structured blocks."""
         try:
-            page_bytes = page.parent.tobytes([page.number])  # export just this page
             elements = partition_pdf(
                 file_content=page_bytes,
                 strategy="hi_res",
                 ocr_strategy="ocr_only",
             )
-
             blocks = []
             for el in elements:
                 block_type = getattr(el, "category", "text").lower()
@@ -62,22 +61,38 @@ class HybridPDFParser:
                     blocks.append({
                         "type": "table",
                         "text": str(el),
-                        "metadata": {"page": page_num + 1, "source": "unstructured-ocr"}
+                        "metadata": {"page": page_num + 1, "source": source}
                     })
                 else:
                     blocks.append({
-                        "type": "text",
+                        "type": "text" if source == "unstructured-ocr" else "image_text",
                         "text": str(el),
-                        "metadata": {"page": page_num + 1, "source": "unstructured-ocr"}
+                        "metadata": {"page": page_num + 1, "source": source}
                     })
             return blocks
-
         except Exception as e:
             raise KnowledgeManagementException(
                 f"OCR extraction failed on page {page_num+1}: {e}",
                 page_num,
                 "HybridPDFParser",
             )
+
+    def _extract_images_with_ocr(self, page, page_num: int) -> list[dict]:
+        """Extract and OCR all images from a page."""
+        results = []
+        for img_index, img in enumerate(page.get_images(full=True)):
+            try:
+                xref = img[0]
+                base_image = page.parent.extract_image(xref)
+                img_bytes = base_image["image"]
+
+                ocr_blocks = self._extract_with_ocr(img_bytes, page_num, source="image-ocr")
+                for blk in ocr_blocks:
+                    blk["metadata"]["image_index"] = img_index
+                results.extend(ocr_blocks)
+            except Exception as e:
+                logger.warning(f"OCR on image {img_index} (page {page_num+1}) failed: {e}")
+        return results
 
     def parse(self, content: bytes) -> list[dict]:
         results = []
@@ -121,10 +136,16 @@ class HybridPDFParser:
                             "metadata": {"page": page_num + 1, "source": "pdfplumber"}
                         })
 
-                else:
-                    # OCR fallback
+                    # Step 4: OCR all images on this page (extra step)
                     if self.enable_ocr:
-                        ocr_blocks = self._extract_with_ocr(page, page_num)
+                        image_ocr_blocks = self._extract_images_with_ocr(page, page_num)
+                        results.extend(image_ocr_blocks)
+
+                else:
+                    # OCR fallback for low-text pages
+                    if self.enable_ocr:
+                        page_bytes = doc.tobytes([page_num])
+                        ocr_blocks = self._extract_with_ocr(page_bytes, page_num)
                         results.extend(ocr_blocks)
                     else:
                         logger.warning(f"Page {page_num+1} skipped (low text, OCR disabled)")
