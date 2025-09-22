@@ -1,7 +1,6 @@
+import io
 import fitz  # PyMuPDF
 import pdfplumber
-import tempfile
-import os
 from unstructured.partition.pdf import partition_pdf
 from utils.logger import logger
 from exceptions import KnowledgeManagementException
@@ -14,6 +13,7 @@ class HybridPDFParser:
     - Uses pdfplumber for improved table parsing
     - Falls back to Unstructured OCR if page has little/no text
     - Deduplicates overlapping table text from PyMuPDF output
+    - Emits separate blocks: {"type": "text"} and {"type": "table"}
     """
 
     def __init__(self, text_threshold: int = 100, enable_ocr: bool = True):
@@ -24,14 +24,14 @@ class HybridPDFParser:
         """Return list of (bbox, text) blocks from PyMuPDF."""
         return page.get_text("blocks")  # (x0, y0, x1, y1, text, block_no,...)
 
-    def _extract_with_pdfplumber(self, pdf_path: str, page_num: int) -> tuple[list[str], list[tuple]]:
+    def _extract_with_pdfplumber(self, pdf_bytes: bytes, page_num: int) -> tuple[list[str], list[tuple]]:
         """
         Extract tables with pdfplumber.
         Returns: (table_texts, table_bboxes)
         """
         tables_text, table_bboxes = [], []
         try:
-            with pdfplumber.open(pdf_path) as pdf:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 page = pdf.pages[page_num]
                 tables = page.find_tables()
                 for table in tables:
@@ -45,23 +45,33 @@ class HybridPDFParser:
             logger.warning(f"pdfplumber failed on page {page_num+1}: {e}")
         return tables_text, table_bboxes
 
-    def _extract_with_ocr(self, doc, page_num: int) -> list[dict]:
+    def _extract_with_ocr(self, page, page_num: int) -> list[dict]:
+        """Extract text and tables with OCR for image-heavy or text-poor pages."""
         try:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                writer = fitz.open()
-                writer.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                writer.save(tmp.name)
-                writer.close()
-                elements = partition_pdf(
-                    filename=tmp.name,
-                    strategy="hi_res",
-                    ocr_strategy="ocr_only",
-                )
-                os.unlink(tmp.name)
-                return [
-                    {"text": str(el), "metadata": {"page": page_num + 1, "source": "unstructured-ocr"}}
-                    for el in elements
-                ]
+            page_bytes = page.parent.tobytes([page.number])  # export just this page
+            elements = partition_pdf(
+                file_content=page_bytes,
+                strategy="hi_res",
+                ocr_strategy="ocr_only",
+            )
+
+            blocks = []
+            for el in elements:
+                block_type = getattr(el, "category", "text").lower()
+                if block_type in ("table", "tabular"):
+                    blocks.append({
+                        "type": "table",
+                        "text": str(el),
+                        "metadata": {"page": page_num + 1, "source": "unstructured-ocr"}
+                    })
+                else:
+                    blocks.append({
+                        "type": "text",
+                        "text": str(el),
+                        "metadata": {"page": page_num + 1, "source": "unstructured-ocr"}
+                    })
+            return blocks
+
         except Exception as e:
             raise KnowledgeManagementException(
                 f"OCR extraction failed on page {page_num+1}: {e}",
@@ -73,12 +83,6 @@ class HybridPDFParser:
         results = []
         try:
             doc = fitz.open(stream=content, filetype="pdf")
-
-            # Save content to temp file for pdfplumber
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
-                tmp_pdf.write(content)
-                tmp_pdf.flush()
-                tmp_path = tmp_pdf.name
 
             for page_num, page in enumerate(doc):
                 # Step 1: extract raw blocks from PyMuPDF
@@ -93,37 +97,38 @@ class HybridPDFParser:
                 raw_text = " ".join(txt for _, txt in raw_text_blocks)
 
                 if len(raw_text.strip()) > self.text_threshold:
-                    # Step 2: extract tables with pdfplumber
-                    tables_text, table_bboxes = self._extract_with_pdfplumber(tmp_path, page_num)
+                    # Step 2: extract tables with pdfplumber (directly from memory)
+                    tables_text, table_bboxes = self._extract_with_pdfplumber(content, page_num)
 
                     # Step 3: filter PyMuPDF blocks that overlap with table bboxes
-                    filtered_texts = []
                     for (x0, y0, x1, y1), txt in raw_text_blocks:
                         overlaps = any(
                             (x0 < tbx1 and x1 > tbx0 and y0 < tby1 and y1 > tby0)
                             for (tbx0, tby0, tbx1, tby1) in table_bboxes
                         )
                         if not overlaps:
-                            filtered_texts.append(txt)
+                            results.append({
+                                "type": "text",
+                                "text": txt.strip(),
+                                "metadata": {"page": page_num + 1, "source": "pymupdf"}
+                            })
 
-                    combined_text = "\n".join(filtered_texts)
-                    if tables_text:
-                        combined_text += "\n" + "\n\n".join(tables_text)
-
-                    results.append({
-                        "text": combined_text.strip(),
-                        "metadata": {"page": page_num + 1, "source": "pymupdf+pdfplumber"}
-                    })
+                    # Add tables as separate blocks
+                    for tbl in tables_text:
+                        results.append({
+                            "type": "table",
+                            "text": tbl.strip(),
+                            "metadata": {"page": page_num + 1, "source": "pdfplumber"}
+                        })
 
                 else:
                     # OCR fallback
                     if self.enable_ocr:
-                        ocr_blocks = self._extract_with_ocr(doc, page_num)
+                        ocr_blocks = self._extract_with_ocr(page, page_num)
                         results.extend(ocr_blocks)
                     else:
                         logger.warning(f"Page {page_num+1} skipped (low text, OCR disabled)")
 
-            os.unlink(tmp_path)
             return results
 
         except Exception as e:
